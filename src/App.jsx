@@ -25,9 +25,9 @@ import {
   orderBy,
   limit,
   serverTimestamp,
+  Timestamp,
 } from "firebase/firestore";
 
-import { Html5Qrcode } from "html5-qrcode";
 import JsBarcode from "jsbarcode";
 import * as XLSX from "xlsx";
 
@@ -37,10 +37,10 @@ import {
   secondaryAuth,
 } from "./firebase";
 
+import Presensi from "./pages/Presensi";
+
 import {
   Camera,
-  CheckCircle2,
-  XCircle,
   LogOut,
   Users,
   GraduationCap,
@@ -58,18 +58,16 @@ import {
   Search,
   School,
   ShieldCheck,
-  Volume2,
   AlertCircle,
   CalendarDays,
   BarChart3,
   Upload,
   FileSpreadsheet,
-  Check,
-  Clock3,
-  UserRoundCheck,
+    UserRoundCheck,
   UserRoundX,
   Stethoscope,
-  EyeOff,
+  Eye,
+  EyeOff
 } from "lucide-react";
 
 
@@ -568,7 +566,7 @@ function Dashboard({
 )}
 
           {page === "absen" && (
-            <Attendance
+            <Presensi
               profile={profile}
               school={school}
             />
@@ -629,446 +627,618 @@ async function fetchClasses() {
 ========================================================= */
 
 function Attendance({ profile }) {
-  const [running, setRunning] = useState(false);
-  const [result, setResult] = useState(null);
-  const [recent, setRecent] = useState([]);
-  const [cameraError, setCameraError] = useState("");
   const [date, setDate] = useState(todayKey());
+  const [recent, setRecent] = useState([]);
+  const [result, setResult] = useState(null);
+
+  const [running, setRunning] = useState(false);
   const [processing, setProcessing] = useState(false);
+  const [cameraError, setCameraError] = useState("");
 
-  const classId =
-    profile.role === "admin"
-      ? ""
-      : profile.classId || "";
+  const scannerRef = useRef(null);
+  const startingCameraRef = useRef(false);
+  const mountedRef = useRef(true);
 
-  // ==========================================
-  // LOAD PRESENSI TERBARU
-  // ==========================================
+  const isAdmin = profile?.role === "admin";
+  const classId = isAdmin ? "" : profile?.classId || "";
+  const readerId = `reader-${profile?.id || "attendance"}`;
+
+  /*
+   * ============================================================
+   * CLEANUP
+   * ============================================================
+   */
+
+  useEffect(() => {
+    mountedRef.current = true;
+
+    return () => {
+      mountedRef.current = false;
+
+      const scanner = scannerRef.current;
+
+      if (scanner) {
+        scannerRef.current = null;
+
+        try {
+          scanner
+            .stop()
+            .catch(() => {})
+            .finally(() => {
+              try {
+                scanner.clear();
+              } catch (_) {}
+            });
+        } catch (_) {
+          try {
+            scanner.clear();
+          } catch (_) {}
+        }
+      }
+    };
+  }, []);
+
+  /*
+   * ============================================================
+   * SUARA
+   * ============================================================
+   */
+
+
+  /*
+   * ============================================================
+   * LOAD PRESENSI TERBARU
+   *
+   * Sengaja TIDAK menggunakan orderBy().
+   * Dengan begitu kita tidak membutuhkan composite index.
+   * ============================================================
+   */
 
   async function loadRecent() {
-    try {
-      if (!classId && profile.role !== "admin") {
-        setRecent([]);
-        return;
-      }
+    if (!mountedRef.current) return;
 
+    try {
       let q;
 
-      if (classId) {
+      if (isAdmin) {
+        q = query(
+          collection(db, "attendance"),
+          where("date", "==", date)
+        );
+      } else {
+        if (!classId) {
+          setRecent([]);
+          return;
+        }
+
         q = query(
           collection(db, "attendance"),
           where("classId", "==", classId),
-          where("date", "==", date),
-          orderBy("time", "desc"),
-          limit(12)
-        );
-      } else {
-        q = query(
-          collection(db, "attendance"),
-          where("date", "==", date),
-          orderBy("time", "desc"),
-          limit(12)
+          where("date", "==", date)
         );
       }
 
       const snap = await getDocs(q);
 
-      setRecent(
-        snap.docs.map((d) => ({
-          id: d.id,
-          ...d.data(),
-        }))
-      );
-    } catch (error) {
-      console.error(
-        "Gagal memuat presensi terbaru:",
-        error
-      );
+      let rows = snap.docs.map((d) => ({
+        id: d.id,
+        ...d.data(),
+      }));
 
-      // Jangan membuat halaman rusak hanya karena
-      // daftar presensi gagal dimuat.
-      setRecent([]);
+      /*
+       * Urutkan di browser, bukan Firestore.
+       * Jadi tidak perlu composite index.
+       */
+      rows.sort((a, b) => {
+        const timeA = a.time || "";
+        const timeB = b.time || "";
+
+        return timeB.localeCompare(timeA);
+      });
+
+      rows = rows.slice(0, 12);
+
+      if (mountedRef.current) {
+        setRecent(rows);
+      }
+    } catch (error) {
+      console.error("Gagal memuat presensi terbaru:", error);
+
+      if (mountedRef.current) {
+        setRecent([]);
+      }
     }
   }
 
   useEffect(() => {
     loadRecent();
-  }, [classId, date, profile.role]);
+  }, [date, classId, isAdmin]);
 
-  // ==========================================
-  // START CAMERA
-  // ==========================================
+  /*
+   * ============================================================
+   * STOP CAMERA
+   * ============================================================
+   */
 
-  useEffect(() => {
-    let scanner = null;
-    let cancelled = false;
+  async function stopCamera() {
+    const scanner = scannerRef.current;
 
-    async function startScanner() {
-      if (!running) return;
-
-      setCameraError("");
-
-      try {
-        // Pastikan elemen reader sudah ada
-        const reader = document.getElementById("reader");
-
-        if (!reader) {
-          throw new Error(
-            "Area kamera tidak ditemukan."
-          );
-        }
-
-        scanner = new Html5Qrcode("reader");
-
-        // ======================================
-        // COBA KAMERA BELAKANG
-        // ======================================
-
-        try {
-          await scanner.start(
-            {
-              facingMode: {
-                exact: "environment",
-              },
-            },
-            {
-              fps: 10,
-              qrbox: {
-                width: 280,
-                height: 160,
-              },
-              aspectRatio: 1.777,
-            },
-            async (decodedText) => {
-              if (cancelled || processing) return;
-
-              await processCode(
-                decodedText,
-                scanner
-              );
-            },
-            () => {}
-          );
-        } catch (environmentError) {
-          console.warn(
-            "Kamera environment gagal:",
-            environmentError
-          );
-
-          // ====================================
-          // FALLBACK KAMERA
-          // ====================================
-
-          await scanner.start(
-            {
-              facingMode: "environment",
-            },
-            {
-              fps: 10,
-              qrbox: 250,
-            },
-            async (decodedText) => {
-              if (cancelled || processing) return;
-
-              await processCode(
-                decodedText,
-                scanner
-              );
-            },
-            () => {}
-          );
-        }
-      } catch (error) {
-        console.error(
-          "Kamera gagal dibuka:",
-          error
-        );
-
-        if (!cancelled) {
-          setCameraError(
-            "Kamera tidak dapat dibuka. Pastikan izin kamera diberikan dan aplikasi dijalankan melalui HTTPS atau localhost."
-          );
-
-          setRunning(false);
-        }
+    if (!scanner) {
+      if (mountedRef.current) {
+        setRunning(false);
       }
+      return;
     }
 
-    startScanner();
+    scannerRef.current = null;
 
-    return () => {
-      cancelled = true;
+    try {
+      await scanner.stop();
+    } catch (error) {
+      console.warn("Kamera sudah berhenti:", error);
+    }
 
-      if (scanner) {
-        scanner
-          .stop()
-          .catch(() => {})
-          .finally(() => {
-            try {
-              scanner.clear();
-            } catch {}
-          });
+    /*
+     * Jangan memaksa clear terlalu agresif.
+     * Ini membantu mencegah error:
+     *
+     * NotFoundError:
+     * Failed to execute 'removeChild'
+     */
+    try {
+      scanner.clear();
+    } catch (error) {
+      console.warn("Camera clear warning:", error);
+    }
+
+    if (mountedRef.current) {
+      setRunning(false);
+    }
+  }
+
+  /*
+   * ============================================================
+   * START CAMERA
+   * ============================================================
+   */
+
+  async function startCamera() {
+    if (startingCameraRef.current) return;
+    if (running) return;
+
+    startingCameraRef.current = true;
+
+    setCameraError("");
+
+    try {
+      /*
+       * Bersihkan scanner lama kalau masih ada.
+       */
+      if (scannerRef.current) {
+        await stopCamera();
       }
-    };
-  }, [running, date]);
 
-  // ==========================================
-  // PROSES BARCODE
-  // ==========================================
+      /*
+       * Pastikan element reader tersedia.
+       */
+      const readerElement = document.getElementById(readerId);
 
-  async function processCode(code, scanner) {
+      if (!readerElement) {
+        throw new Error("Area kamera belum siap.");
+      }
+
+      /*
+       * Pastikan tidak ada sisa DOM dari scanner sebelumnya.
+       */
+      readerElement.innerHTML = "";
+
+      const scanner = new Html5Qrcode(readerId);
+
+      scannerRef.current = scanner;
+
+      /*
+       * Jangan menggunakan:
+       *
+       * { facingMode: { exact: "environment" } }
+       *
+       * karena itu yang menyebabkan:
+       * OverconstrainedError
+       */
+
+      const cameraConfig = {
+        facingMode: "environment",
+      };
+
+      await scanner.start(
+        cameraConfig,
+        {
+          fps: 10,
+          qrbox: {
+            width: 280,
+            height: 160,
+          },
+          aspectRatio: 1.777778,
+        },
+        async (decodedText) => {
+          await processCode(decodedText);
+        },
+        () => {
+          /*
+           * Scan frame gagal tidak perlu ditampilkan.
+           * Barcode scanner memang normal menghasilkan error
+           * di frame-frame yang belum berisi barcode.
+           */
+        }
+      );
+
+      if (mountedRef.current) {
+        setRunning(true);
+      }
+    } catch (error) {
+      console.error("Gagal membuka kamera:", error);
+
+      /*
+       * Jika environment gagal, coba kamera default.
+       */
+      try {
+        const oldScanner = scannerRef.current;
+
+        if (oldScanner) {
+          try {
+            await oldScanner.stop();
+          } catch (_) {}
+
+          try {
+            oldScanner.clear();
+          } catch (_) {}
+        }
+
+        scannerRef.current = null;
+
+        const readerElement = document.getElementById(readerId);
+
+        if (!readerElement) {
+          throw error;
+        }
+
+        readerElement.innerHTML = "";
+
+        const fallbackScanner = new Html5Qrcode(readerId);
+
+        scannerRef.current = fallbackScanner;
+
+        await fallbackScanner.start(
+          {
+            facingMode: "user",
+          },
+          {
+            fps: 10,
+            qrbox: {
+              width: 280,
+              height: 160,
+            },
+            aspectRatio: 1.777778,
+          },
+          async (decodedText) => {
+            await processCode(decodedText);
+          },
+          () => {}
+        );
+
+        if (mountedRef.current) {
+          setRunning(true);
+          setCameraError(
+            "Kamera belakang tidak tersedia. Kamera depan digunakan."
+          );
+        }
+      } catch (fallbackError) {
+        console.error("Gagal membuka kamera fallback:", fallbackError);
+
+        if (mountedRef.current) {
+          setRunning(false);
+          setCameraError(
+            "Kamera tidak dapat dibuka. Pastikan browser memiliki izin kamera."
+          );
+        }
+
+        try {
+          scannerRef.current?.clear();
+        } catch (_) {}
+
+        scannerRef.current = null;
+      }
+    } finally {
+      startingCameraRef.current = false;
+    }
+  }
+
+  function restartCameraAfterResult() {
+  setTimeout(async () => {
+    if (!mountedRef.current) return;
+
+    try {
+      console.log("Membuka kamera kembali setelah hasil scan...");
+
+      await startCamera();
+    } catch (error) {
+      console.error(
+        "Gagal membuka kamera kembali:",
+        error
+      );
+    }
+  }, 2000);
+}
+
+  /*
+   * ============================================================
+   * PROCESS BARCODE
+   * ============================================================
+   */
+
+  function restartCameraAfterResult() {
+  setTimeout(async () => {
+    if (!mountedRef.current) return;
+
+    try {
+      console.log("Membuka kamera kembali setelah hasil scan...");
+      await startCamera();
+    } catch (error) {
+      console.error("Gagal membuka kamera kembali:", error);
+    }
+  }, 2000);
+}
+  
+  
+  async function processCode(decodedText) {
+    /*
+     * Cegah satu barcode diproses berkali-kali
+     * ketika kamera membaca barcode beberapa frame.
+     */
     if (processing) return;
 
     setProcessing(true);
-    setRunning(false);
 
-    const clean = String(code || "").trim();
+    const clean = String(decodedText || "").trim();
+
+    console.log("=================================");
+    console.log("SCAN BARCODE");
+    console.log("Barcode:", clean);
+    console.log("Role:", profile?.role);
+    console.log("Class ID:", profile?.classId);
+    console.log("=================================");
 
     if (!clean) {
       setProcessing(false);
       return;
     }
 
+    /*
+     * Hentikan kamera sementara ketika barcode berhasil dibaca.
+     */
+    await stopCamera();
+
     try {
-      // ======================================
-      // CARI SISWA
-      // ======================================
+      /*
+       * ========================================================
+       * 1. CARI SISWA
+       *
+       * Kita hanya menggunakan query classId untuk guru.
+       * Barcode dicari di JavaScript.
+       *
+       * Keuntungannya:
+       * - tidak membutuhkan composite index
+       * - lebih mudah dikontrol oleh Firestore Rules
+       * ========================================================
+       */
 
       let studentQuery;
 
-      if (classId) {
+      if (isAdmin) {
         studentQuery = query(
-          collection(db, "students"),
-          where("classId", "==", classId),
-          where("barcode", "==", clean),
-          limit(1)
+          collection(db, "students")
         );
       } else {
+        if (!classId) {
+          throw new Error(
+            "Akun guru belum memiliki kelas."
+          );
+        }
+
         studentQuery = query(
           collection(db, "students"),
-          where("barcode", "==", clean),
-          limit(1)
+          where("classId", "==", classId)
         );
       }
 
-      const studentSnap =
-        await getDocs(studentQuery);
+      const studentSnap = await getDocs(studentQuery);
 
-      // ======================================
-      // BARCODE TIDAK DITEMUKAN
-      // ======================================
+      console.log(
+        "Jumlah siswa yang dapat dibaca:",
+        studentSnap.size
+      );
 
-      if (studentSnap.empty) {
-        setResult({
-          ok: false,
-          type: "not-found",
-          title: "ABSEN GAGAL",
-          message:
-            classId
-              ? "Barcode tidak terdaftar pada kelas Anda."
-              : "Barcode siswa tidak terdaftar.",
-          code: clean,
-        });
+      let student = null;
 
-        speak(
-          "Absen gagal",
-          false
+      studentSnap.forEach((docSnap) => {
+        const data = docSnap.data();
+
+        const studentBarcode =
+          data.barcode === undefined ||
+          data.barcode === null
+            ? ""
+            : String(data.barcode).trim();
+
+        if (studentBarcode === clean) {
+          student = {
+            id: docSnap.id,
+            ...data,
+          };
+        }
+      });
+
+      /*
+       * ========================================================
+       * 2. BARCODE TIDAK DITEMUKAN
+       * ========================================================
+       */
+
+      if (!student) {
+        console.warn(
+          "Barcode tidak ditemukan:",
+          clean
         );
 
-        setTimeout(() => {
-          setProcessing(false);
-          setRunning(true);
-        }, 1200);
+        if (mountedRef.current) {
+          setResult({
+            type: "error",
+            title: "ABSEN GAGAL",
+            message: isAdmin
+              ? "Barcode siswa tidak terdaftar."
+              : "Barcode tidak terdaftar pada kelas Anda.",
+          });
+        }
+
+        speak("Absen gagal", false);
+
+        restartCameraAfterResult();
 
         return;
       }
 
-      // ======================================
-      // DATA SISWA
-      // ======================================
+      console.log("Siswa ditemukan:", student);
 
-      const student = {
-        id: studentSnap.docs[0].id,
-        ...studentSnap.docs[0].data(),
-      };
+      /*
+       * ========================================================
+       * 3. VALIDASI KELAS GURU
+       * ========================================================
+       */
 
-      // ======================================
-      // VALIDASI KELAS GURU
-      // ======================================
+      if (!isAdmin) {
+        if (student.classId !== classId) {
+          if (mountedRef.current) {
+            setResult({
+              type: "error",
+              title: "ABSEN GAGAL",
+              message: "Siswa bukan bagian dari kelas Anda.",
+            });
+          }
 
-      if (
-        profile.role === "teacher" &&
-        student.classId !== profile.classId
-      ) {
-        setResult({
-          ok: false,
-          type: "wrong-class",
-          title: "KELAS TIDAK SESUAI",
-          message:
-            `${student.name} bukan siswa kelas ${profile.className || "-"}.`,
-          student,
-        });
+          speak("Absen gagal", false);
 
-        speak(
-          "Kelas tidak sesuai",
-          false
-        );
-
-        setTimeout(() => {
-          setProcessing(false);
-          setRunning(true);
-        }, 1200);
-
-        return;
+          restartCameraAfterResult();
+          
+          return;
+        }
       }
 
-      // ======================================
-      // ID PRESENSI
-      // ======================================
+      /*
+       * ========================================================
+       * 4. ID PRESENSI
+       *
+       * Satu siswa hanya boleh punya satu presensi per hari.
+       * ========================================================
+       */
 
       const attendanceId =
         `${date}_${student.id}`;
 
-      const attendanceRef =
-        doc(
-          db,
-          "attendance",
-          attendanceId
-        );
+      const attendanceRef = doc(
+        db,
+        "attendance",
+        attendanceId
+      );
 
-      // ======================================
-      // CEK SUDAH ABSEN
-      // ======================================
+      /*
+       * ========================================================
+       * 5. CEK SUDAH ABSEN ATAU BELUM
+       * ========================================================
+       */
 
-      const existing =
+      const existingAttendance =
         await getDoc(attendanceRef);
 
-      if (existing.exists()) {
-        const oldData =
-          existing.data();
+      if (existingAttendance.exists()) {
+        if (mountedRef.current) {
+          setResult({
+            type: "warning",
+            title: "SUDAH ABSEN",
+            message:
+              `${student.name} sudah melakukan presensi hari ini.`,
+            student,
+          });
+        }
 
-        setResult({
-          ok: false,
-          type: "duplicate",
-          title: "SUDAH ABSEN",
-          message:
-            `${student.name} sudah melakukan presensi hari ini.`,
-          student,
-          attendance: oldData,
-        });
+        speak("Siswa sudah absen", false);
 
-        speak(
-          "Siswa sudah absen",
-          false
-        );
-
-        setTimeout(() => {
-          setProcessing(false);
-          setRunning(true);
-        }, 1200);
+        restartCameraAfterResult();
 
         return;
       }
 
-      // ======================================
-      // SIMPAN PRESENSI
-      // ======================================
+      /*
+       * ========================================================
+       * 6. SIMPAN PRESENSI
+       * ========================================================
+       */
 
-      const currentTime =
-        new Date().toLocaleTimeString(
+      const attendanceData = {
+        studentId: student.id,
+        studentName: student.name || "",
+        nis: student.nis || "",
+        classId: student.classId || "",
+        className: student.className || "",
+        date,
+        time: new Date().toLocaleTimeString(
           "id-ID",
           {
             hour: "2-digit",
             minute: "2-digit",
             second: "2-digit",
           }
-        );
+        ),
+        timestamp: serverTimestamp(),
+        status: "Hadir",
+        barcode: clean,
+      };
+
+      console.log(
+        "Menyimpan attendance:",
+        attendanceData
+      );
 
       await setDoc(
         attendanceRef,
-        {
-          studentId: student.id,
-
-          studentName:
-            student.name || "",
-
-          nis:
-            student.nis || "",
-
-          classId:
-            student.classId || "",
-
-          className:
-            student.className || "",
-
-          date,
-
-          time: currentTime,
-
-          timestamp:
-            serverTimestamp(),
-
-          status: "Hadir",
-
-          barcode: clean,
-
-          createdBy:
-            profile.id || null,
-
-          createdByRole:
-            profile.role || "",
-
-          createdAt:
-            serverTimestamp(),
-        }
+        attendanceData
       );
 
-      // ======================================
-      // BERHASIL
-      // ======================================
+      /*
+       * ========================================================
+       * 7. BERHASIL
+       * ========================================================
+       */
 
-      setResult({
-        ok: true,
-        type: "success",
-        title: "ABSEN BERHASIL",
-        message:
-          `Selamat datang, ${student.name}!`,
-        student,
-        attendance: {
-          date,
-          time: currentTime,
-        },
-      });
-
-      speak(
-        "Absen berhasil",
-        true
-      );
-
-      // ======================================
-      // LOAD RECENT
-      //
-      // KALAU GAGAL TIDAK BOLEH MEMBUAT
-      // HASIL SCAN BERUBAH MENJADI GAGAL.
-      // ======================================
-
-      try {
-        await loadRecent();
-      } catch (recentError) {
-        console.error(
-          "Gagal memuat presensi terbaru:",
-          recentError
-        );
+      if (mountedRef.current) {
+        setResult({
+          type: "success",
+          title: "ABSEN BERHASIL",
+          message:
+            `${student.name} berhasil melakukan presensi.`,
+          student,
+        });
       }
 
-      // ======================================
-      // BUKA KAMERA KEMBALI
-      // ======================================
+      speak("Absen berhasil", true);
 
-      setTimeout(() => {
-        setProcessing(false);
-        setRunning(true);
-      }, 1200);
+      /*
+       * Muat ulang daftar presensi.
+       */
+      await loadRecent();
+
+      /*
+ * Buka kembali kamera secara otomatis
+ * setelah jeda 2 detik.
+ */
+      restartCameraAfterResult();
 
     } catch (error) {
       console.error(
@@ -1079,416 +1249,353 @@ function Attendance({ profile }) {
       let message =
         "Terjadi kesalahan saat menyimpan presensi.";
 
-      // ======================================
-      // FIRESTORE PERMISSION ERROR
-      // ======================================
-
       if (
         error?.code ===
         "permission-denied"
       ) {
         message =
-          "Tidak memiliki izin untuk menyimpan presensi. Periksa Firestore Rules.";
-      }
-
-      // ======================================
-      // NETWORK ERROR
-      // ======================================
-
-      else if (
+          "Akses Firestore ditolak. Periksa akun guru, kelas, dan Firestore Rules.";
+      } else if (
         error?.code ===
         "unavailable"
       ) {
         message =
-          "Koneksi ke server tidak tersedia.";
+          "Firebase tidak dapat dihubungi. Periksa koneksi internet.";
       }
 
-      setResult({
-        ok: false,
-        type: "error",
-        title: "ABSEN GAGAL",
-        message,
-        code: clean,
-      });
+      if (mountedRef.current) {
+        setResult({
+          type: "error",
+          title: "ABSEN GAGAL",
+          message,
+        });
+      }
 
-      speak(
-        "Absen gagal",
-        false
-      );
+      speak("Absen gagal", false);
 
-      setTimeout(() => {
+      restartCameraAfterResult();
+
+    } finally {
+      if (mountedRef.current) {
         setProcessing(false);
-        setRunning(true);
-      }, 1500);
+      }
     }
   }
 
-  // ==========================================
-  // UI
-  // ==========================================
+  /*
+   * ============================================================
+   * RENDER
+   * ============================================================
+   */
 
   return (
     <div className="page">
-
-      {/* ====================================
-          HEADER
-      ==================================== */}
-
-      <div className="page-title">
-
+      <div className="page-header">
         <div>
-          <h2>
-            Presensi Barcode
-          </h2>
+          <h1>Presensi</h1>
 
-          <p>
-            Scan barcode siswa.
-            Kamera akan aktif kembali
-            secara otomatis setelah proses.
+          <p className="muted">
+            {isAdmin
+              ? "Scan barcode siswa"
+              : `Scan barcode siswa kelas ${profile?.className || "-"}`}
           </p>
         </div>
 
-        <div className="date-actions">
-
-          <label className="date-input">
+        <div className="form-row">
+          <label>
             Tanggal
-
             <input
               type="date"
               value={date}
               onChange={(e) => {
-                setDate(
-                  e.target.value
-                );
-
+                setDate(e.target.value);
                 setResult(null);
               }}
             />
           </label>
-
-          <button
-            className="btn"
-            onClick={() => {
-              setDate(todayKey());
-              setResult(null);
-            }}
-          >
-            <CalendarDays size={16} />
-            Hari Ini
-          </button>
-
         </div>
-
       </div>
-
-      {/* ====================================
-          GRID
-      ==================================== */}
 
       <div className="attendance-grid">
 
-        {/* ==================================
-            SCANNER
-        ================================== */}
+        {/* =====================================================
+            KAMERA
+        ====================================================== */}
 
-        <section className="card scanner-card">
-
-          <div className="scanner-head">
-
+        <div className="card">
+          <div className="card-header">
             <div>
-              <b>
-                Scanner Kamera
-              </b>
+              <h2>Scan Barcode</h2>
 
-              <span>
-                Gunakan kamera belakang perangkat
-              </span>
+              <p className="muted">
+                Arahkan barcode siswa ke kamera.
+              </p>
             </div>
 
+            <ScanLine size={22} />
+          </div>
+
+          <div className="camera-wrapper">
             <div
-              className={
-                "status-dot " +
-                (running
-                  ? "on"
-                  : "off")
-              }
-            >
-              {running
-                ? "AKTIF"
-                : "SIAP"}
-            </div>
-
+              id={readerId}
+              className="qr-reader"
+            />
           </div>
-
-          <div
-            id="reader"
-            className="reader"
-          >
-
-            {!running && (
-              <div className="reader-placeholder">
-
-                <Camera size={42} />
-
-                <span>
-                  Kamera belum aktif
-                </span>
-
-              </div>
-            )}
-
-            {running && (
-              <div className="reader-placeholder">
-                <Camera size={42} />
-
-                <span>
-                  Membuka kamera...
-                </span>
-              </div>
-            )}
-
-          </div>
-
-          {/* ERROR */}
 
           {cameraError && (
-            <div className="alert error">
-
-              <AlertCircle
-                size={18}
-              />
+            <div className="alert alert-warning">
+              <AlertCircle size={18} />
 
               <span>
                 {cameraError}
               </span>
-
             </div>
           )}
 
-          {/* BUTTON */}
+          <div className="camera-actions">
 
-          <button
-            className={
-              "btn full " +
-              (running
-                ? "danger"
-                : "primary")
-            }
-            disabled={processing}
-            onClick={() => {
-
-              setCameraError("");
-
-              setRunning(
-                (value) => !value
-              );
-
-            }}
-          >
-
-            {running ? (
-              <>
-                <XCircle size={18} />
-
-                Hentikan Kamera
-              </>
-            ) : (
-              <>
+            {!running ? (
+              <button
+                className="btn btn-primary"
+                onClick={startCamera}
+                disabled={processing}
+              >
                 <Camera size={18} />
 
-                Buka Kamera &
-                Mulai Absen
-              </>
+                {processing
+                  ? "Memproses..."
+                  : "Buka Kamera & Mulai Absen"}
+              </button>
+            ) : (
+              <button
+                className="btn btn-secondary"
+                onClick={stopCamera}
+                disabled={processing}
+              >
+                <X size={18} />
+                Tutup Kamera
+              </button>
             )}
 
-          </button>
-
-          <div className="scan-help">
-
-            <Volume2 size={16} />
-
-            <span>
-              Suara otomatis:
-              “Absen berhasil”
-              atau “Absen gagal”.
-            </span>
-
           </div>
 
-        </section>
-
-        {/* ==================================
-            RESULT
-        ================================== */}
-
-        <section className="card result-card">
-
-          <div className="section-title">
-
-            <b>
-              Hasil Scan
-            </b>
-
-            <span>
-              {date === todayKey()
-                ? "Hari ini"
-                : fmtDate(date)}
-            </span>
-
-          </div>
-
-          {!result ? (
-
-            <div className="empty">
-
-              <ScanLine
-                size={44}
+          {processing && (
+            <div className="scan-processing">
+              <RefreshCw
+                size={18}
+                className="spin"
               />
 
-              <b>
-                Belum ada scan
-              </b>
-
               <span>
-                Hasil scan akan
-                tampil di sini.
+                Memproses barcode...
               </span>
+            </div>
+          )}
+        </div>
 
+        {/* =====================================================
+            HASIL SCAN
+        ====================================================== */}
+
+        <div className="card">
+          <div className="card-header">
+            <div>
+              <h2>Hasil Scan</h2>
+
+              <p className="muted">
+                Status presensi siswa
+              </p>
             </div>
 
-          ) : (
+            <CheckCircle2 size={22} />
+          </div>
 
-            <div
-              className={
-                "result " +
-                (result.ok
-                  ? "success"
-                  : "failed")
-              }
-            >
-
-              {result.ok ? (
-                <CheckCircle2
-                  size={60}
-                />
-              ) : (
-                <XCircle
-                  size={60}
-                />
-              )}
+          {!result && (
+            <div className="empty-state">
+              <ScanLine size={42} />
 
               <h3>
-                {result.title}
+                Belum ada scan
               </h3>
 
-              {result.student && (
-                <>
-                  <b>
-                    {result.student.name}
-                  </b>
-
-                  <small>
-                    {result.student.className ||
-                      ""}
-                    {result.student.nis
-                      ? ` • NIS ${result.student.nis}`
-                      : ""}
-                  </small>
-                </>
-              )}
-
-              <span>
-                {result.message}
-              </span>
-
-              {result.attendance?.time && (
-                <small>
-                  Waktu:{" "}
-                  {result.attendance.time}
-                </small>
-              )}
-
+              <p className="muted">
+                Silakan buka kamera dan scan
+                barcode siswa.
+              </p>
             </div>
-
           )}
 
-          {/* =================================
-              RECENT
-          ================================= */}
+          {result?.type === "success" && (
+            <div className="scan-result success">
+              <CheckCircle2 size={54} />
 
-          <div
-            className={
-              "section-title recent-title"
-            }
-          >
+              <h2>
+                {result.title}
+              </h2>
 
-            <b>
-              Presensi Terakhir
-            </b>
+              <h3>
+                {result.student?.name}
+              </h3>
 
+              <p>
+                {result.student?.className}
+              </p>
+
+              <p className="muted">
+                {result.student?.nis
+                  ? `NIS: ${result.student.nis}`
+                  : ""}
+              </p>
+
+              <div className="result-message">
+                {result.message}
+              </div>
+            </div>
+          )}
+
+          {result?.type === "warning" && (
+            <div className="scan-result warning">
+              <AlertCircle size={54} />
+
+              <h2>
+                {result.title}
+              </h2>
+
+              <h3>
+                {result.student?.name}
+              </h3>
+
+              <p>
+                {result.message}
+              </p>
+            </div>
+          )}
+
+          {result?.type === "error" && (
+            <div className="scan-result error">
+              <XCircle size={54} />
+
+              <h2>
+                {result.title}
+              </h2>
+
+              <p>
+                {result.message}
+              </p>
+            </div>
+          )}
+
+          {result && (
             <button
-              className="icon-btn"
-              onClick={() =>
-                loadRecent()
-              }
-              title="Refresh"
+              className="btn btn-secondary full-width"
+              onClick={() => {
+                setResult(null);
+
+                /*
+                 * Kamera baru dibuka setelah
+                 * pengguna siap scan berikutnya.
+                 */
+              }}
             >
-              <RefreshCw
-                size={16}
-              />
+              <ScanLine size={18} />
+              Scan Lagi
             </button>
-
-          </div>
-
-          <div className="mini-list">
-
-            {recent.length > 0 ? (
-
-              recent.map((item) => (
-
-                <div
-                  key={item.id}
-                >
-
-                  <div>
-
-                    <b>
-                      {item.studentName}
-                    </b>
-
-                    <small>
-                      {item.className ||
-                        "-"}
-                      {" • "}
-                      {item.status ||
-                        "-"}
-                    </small>
-
-                  </div>
-
-                  <time>
-                    {item.time ||
-                      "-"}
-                  </time>
-
-                </div>
-
-              ))
-
-            ) : (
-
-              <span className="muted">
-                Belum ada presensi.
-              </span>
-
-            )}
-
-          </div>
-
-        </section>
-
+          )}
+        </div>
       </div>
 
+      {/* =======================================================
+          PRESENSI TERBARU
+      ======================================================== */}
+
+      <div className="card recent-card">
+        <div className="card-header">
+          <div>
+            <h2>
+              Presensi Hari Ini
+            </h2>
+
+            <p className="muted">
+              {isAdmin
+                ? "Semua kelas"
+                : `Kelas ${profile?.className || "-"}`}
+            </p>
+          </div>
+
+          <button
+            className="btn btn-secondary"
+            onClick={loadRecent}
+          >
+            <RefreshCw size={16} />
+            Refresh
+          </button>
+        </div>
+
+        {recent.length === 0 ? (
+          <div className="empty-state">
+            <Clock3 size={40} />
+
+            <p>
+              Belum ada presensi hari ini.
+            </p>
+          </div>
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>No</th>
+                  <th>Nama</th>
+                  <th>NIS</th>
+
+                  {isAdmin && (
+                    <th>Kelas</th>
+                  )}
+
+                  <th>Jam</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+
+              <tbody>
+                {recent.map((item, index) => (
+                  <tr key={item.id}>
+                    <td>
+                      {index + 1}
+                    </td>
+
+                    <td>
+                      <strong>
+                        {item.studentName || "-"}
+                      </strong>
+                    </td>
+
+                    <td>
+                      {item.nis || "-"}
+                    </td>
+
+                    {isAdmin && (
+                      <td>
+                        {item.className || "-"}
+                      </td>
+                    )}
+
+                    <td>
+                      {item.time || "-"}
+                    </td>
+
+                    <td>
+                      <span className="status-badge hadir">
+                        {item.status || "Hadir"}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
